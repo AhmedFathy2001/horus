@@ -5,11 +5,13 @@ from dataclasses import dataclass, field
 import numpy as np
 import simpy
 
-from .agent import Agent, AGENT_CAPABILITIES
+from .agent import Agent
 from .coordinator import Coordinator
-from .facility import ZONES_BY_NAME, generation_points, distance_m, worker_zones
+from .facility import (
+    ZONES_BY_NAME, generation_points, distance_m, worker_zones,
+    POOL_SOURCE_NAME,
+)
 from .metrics import RunMetrics
-from .sensors import GAMMA_CONSTANTS_uSv_h_per_MBq_at_1m
 from .waste_generator import WasteStream
 
 
@@ -47,7 +49,6 @@ class TickContext:
     coord: Coordinator
     active_items: dict
     stream: WasteStream
-    scan_queue: simpy.Store
     handle_queue: simpy.Store
     rescan_queue: simpy.Store
     cfg: "ScenarioConfig"
@@ -86,18 +87,10 @@ class TickContext:
         }
         # Tricky items go through the same Char-station pipeline as
         # regular drums: cart stages drum to Char, brain classifies, brain
-        # dispatches the next leg.
-        put_event = _enqueue_initial_task(
-            self.coord, self.scan_queue, self.handle_queue, item, zone,
-        )
-        if put_event is not None:
-            # In isolated mode the enqueue is a deferred .put() that the
-            # caller is normally responsible for yielding. Here we're
-            # inside a UI handler (not a simpy process), so we trigger it
-            # synchronously by triggering the Store directly. simpy.Store
-            # processes the put immediately when called from outside an
-            # active simpy.Process.
-            pass
+        # dispatches the next leg. (In isolated mode this returns a deferred
+        # handle_queue.put(); calling it from a UI handler triggers the Store
+        # immediately, which is what we want.)
+        _enqueue_initial_task(self.coord, self.handle_queue, item, zone)
         return item.item_id
 
     def failover_coordinator(self) -> bool:
@@ -144,17 +137,15 @@ class TickContext:
         a.state = "FAILED"
         a.failure_time_s = self.env.now
         # Drop any item the agent was carrying — and any tasks already
-        # queued for this specific drone — back into the right queue so
-        # another drone can pick the work up. Recovered tasks keep their
-        # original "kind" (scan vs handle) so a scanner can't end up with
-        # a handle task and vice-versa.
+        # queued for this specific drone — back into the queue so another
+        # cart can pick the work up.
         from .facility import ZONES_BY_NAME
         recovered: list[dict] = []
         if a.carrying is not None:
             pickup_zone = ZONES_BY_NAME.get(a.carrying.generation_point)
             if pickup_zone is not None:
-                # The dead drone was already past the scan step (it was
-                # carrying), so this is a handle task. Re-derive the target.
+                # The dead cart was carrying a drum, so this is a transport
+                # (handle) task. Re-derive the target.
                 entry = self.coord.ledger.get(a.carrying.item_id)
                 cls = entry.current_classification if entry else None
                 target_zone = None
@@ -185,10 +176,7 @@ class TickContext:
             if self.coord.shared:
                 self.coord.enqueue_task(t)
             else:
-                if t.get("kind") == "scan":
-                    self.scan_queue.put(t)
-                else:
-                    self.handle_queue.put(t)
+                self.handle_queue.put(t)
         # Tag the event in the coordinator's wire trace
         self.coord.recent_messages.append({
             "t_s": __import__("time").time(),
@@ -211,12 +199,11 @@ class TickContext:
 class ScenarioConfig:
     mode: str              # "isolated" or "hivemind"
     seed: int
-    # Robot fleet composition. Scanners are fast/light sensor-only AGVs;
-    # Handlers are slower gripper AGVs; Hybrids do both. n_mobile_agents is
+    # Robot fleet composition. Every mobile cart is a transport AGV;
+    # Handlers and Hybrids differ only by chassis speed. n_mobile_agents is
     # the legacy single-knob default — when set, it builds n_mobile_agents
-    # Hybrid drones. Pass explicit n_scanners/n_handlers/n_hybrids to mix.
+    # Hybrid carts. Pass explicit n_handlers/n_hybrids to mix.
     n_mobile_agents: int = 3
-    n_scanners: int = 0
     n_handlers: int = 0
     n_hybrids: int = 0
     sim_duration_s: float = 8 * 3600.0     # 8-hour shift simulated time
@@ -249,34 +236,40 @@ class ScenarioConfig:
     def fleet_composition(self) -> list[str]:
         """Return the list of agent_type strings for the mobile fleet.
 
-        With centralized classification at the Char Station, *scanners* are
-        obsolete — carts don't classify any more, they only transport.
-        Any requested scanner slots are silently promoted to handlers
-        (forklifts) so the fleet has useful units. Hybrids are kept (they
-        already do both scan + handle; the scan capability just goes
-        unused in the new model).
+        With centralized classification at the Char Station, every cart is a
+        transport AGV — Handlers and Hybrids differ only by chassis speed.
         """
-        explicit = self.n_scanners + self.n_handlers + self.n_hybrids
+        explicit = self.n_handlers + self.n_hybrids
         if explicit > 0:
-            return (
-                ["handler"] * (self.n_scanners + self.n_handlers)
-                + ["hybrid"] * self.n_hybrids
-            )
+            return ["handler"] * self.n_handlers + ["hybrid"] * self.n_hybrids
         return ["hybrid"] * self.n_mobile_agents
 
 
-def _estimate_dose_rate_from_activities(activities_bq: dict[str, float]) -> float:
-    """Rough estimate (uSv/h at 1m, unshielded) — used only by the dose-tick
-    process to bookkeep accumulating worker exposure. Not used in
-    classification."""
-    rate = 0.0
-    for nuc, act in activities_bq.items():
-        const = GAMMA_CONSTANTS_uSv_h_per_MBq_at_1m.get(nuc, 0.0)
-        rate += const * (act / 1e6)
-    return rate
+# Representative unshielded dose rate (µSv/h at 1 m) by waste class, used for
+# the worker-dose metric. Deliberately a small bounded lookup rather than the
+# raw activity-derived rate: the demo's dose signal must come from HOW MANY hot
+# drums sit unshielded (i.e. how many ILW drums got mis-filed into the
+# low-level store), not from one drum's heavy activity tail. The old
+# activity-derived rate had a multi-order-of-magnitude tail that let a single
+# mis-routed hot drum blow the cumulative dose up to physically absurd values
+# (tens of millions of µSv) and swamp the isolated-vs-hivemind comparison.
+REP_DOSE_RATE_uSv_h: dict[str, float] = {
+    "VLLW": 0.5,
+    "LLW":  15.0,
+    "ILW":  4000.0,
+    "HLW":  0.0,     # HLW is always in a shielded cask / vault — never exposes
+}
 
 
-def _enqueue_initial_task(coordinator: Coordinator, scan_queue: simpy.Store,
+def _representative_dose_rate(true_class: str) -> float:
+    """Bounded per-class worker-exposure rate (µSv/h at 1 m). See
+    REP_DOSE_RATE_uSv_h. The hazard tracks the item's TRUE class — a mis-filed
+    ILW drum is dangerous precisely because it is really ILW even though the
+    paperwork says LLW."""
+    return REP_DOSE_RATE_uSv_h.get(true_class, 0.0)
+
+
+def _enqueue_initial_task(coordinator: Coordinator,
                           handle_queue: simpy.Store, item, pickup_zone):
     """Push a freshly-generated item into the right queue.
 
@@ -299,15 +292,9 @@ def _enqueue_initial_task(coordinator: Coordinator, scan_queue: simpy.Store,
             "is_hlw_route": True, "needs_qa": False,
         }
     else:
+        # Char station is always present; route the drum there for the
+        # central NaI + CV scan. The actuator emits the onward task.
         char_z = char_station_zone()
-        if char_z is None:
-            # Char station missing (shouldn't happen) — fall back to
-            # routing to the default scanner path so the demo doesn't lock.
-            task = {"kind": "scan", "item": item, "pickup_zone": pickup_zone}
-            if coordinator.shared:
-                coordinator.enqueue_task(task)
-                return None
-            return scan_queue.put(task)
         task = {
             "kind": "handle", "item": item,
             "pickup_zone": pickup_zone,
@@ -327,7 +314,6 @@ def _char_station_actuator_proc(
     coord: Coordinator,
     metrics: RunMetrics,
     rng: np.random.Generator,
-    scan_queue: simpy.Store,
     handle_queue: simpy.Store,
     qa_sampling_fraction: float,
 ):
@@ -448,7 +434,6 @@ def _char_station_actuator_proc(
 def _waste_generator_proc(
     env: simpy.Environment,
     stream: WasteStream,
-    scan_queue: simpy.Store,
     handle_queue: simpy.Store,
     coordinator: Coordinator,
     cfg: ScenarioConfig,
@@ -478,7 +463,7 @@ def _waste_generator_proc(
             "pos": (zone.x, zone.y),
             "shielded": False,
         }
-        put_event = _enqueue_initial_task(coordinator, scan_queue, handle_queue,
+        put_event = _enqueue_initial_task(coordinator, handle_queue,
                                           item, zone)
         if put_event is not None:
             yield put_event
@@ -488,7 +473,6 @@ def _process_stage_generator_proc(
     env: simpy.Environment,
     zone,
     stream: WasteStream,
-    scan_queue: simpy.Store,
     handle_queue: simpy.Store,
     coordinator: Coordinator,
     cfg: ScenarioConfig,
@@ -528,7 +512,7 @@ def _process_stage_generator_proc(
             "pos": (zone.x, zone.y),
             "shielded": process_known,  # HLW casks are shielded in transit
         }
-        put_event = _enqueue_initial_task(coordinator, scan_queue, handle_queue,
+        put_event = _enqueue_initial_task(coordinator, handle_queue,
                                           item, zone)
         if put_event is not None:
             yield put_event
@@ -539,15 +523,11 @@ def _dispatcher_proc(
     coordinator: Coordinator,
     agents: list,
 ):
-    """Hivemind dispatcher: continuously picks up pending tasks and assigns
-    each one to the best-scoring idle mobile drone *that has the required
-    capability for the task kind*. If no capable idle drone is available
-    the task stays in the pending pool.
-
-    Tasks with kind="scan" require an agent with "scan" capability
-    (scanner / hybrid); kind="handle" requires "handle" (handler / hybrid).
-    """
-    from .agent import AGENT_CAPABILITIES
+    """Hivemind dispatcher: continuously picks up pending transport tasks and
+    assigns each to the best-scoring idle cart (nearest / most charged / least
+    irradiated — see Coordinator.score_agent_for_task). If no idle cart is
+    available the task stays in the pending pool. Every mobile cart is a
+    transport AGV, so any idle one can take any task."""
     # Tight poll interval so the dispatcher reacts quickly to respawned
     # carts and freshly-enqueued tasks. At 1x sim speed the user notices
     # any > ~0.5 wall-sec lag between a cart respawn and its first move.
@@ -556,10 +536,6 @@ def _dispatcher_proc(
         # Wait until there's at least one pending task
         while not coordinator.pending_tasks:
             yield env.timeout(POLL_S)
-        # Find the first pending task that has a capable idle agent
-        chosen_task_idx = None
-        chosen_task = None
-        chosen_agent = None
         idle_pool = [
             a for a in agents
             if (not a.is_rescrutiny_station)
@@ -569,27 +545,15 @@ def _dispatcher_proc(
         if not idle_pool:
             yield env.timeout(POLL_S)
             continue
-        for i, task in enumerate(coordinator.pending_tasks):
-            needed = "scan" if task.get("kind") == "scan" else "handle"
-            candidates = [
-                a for a in idle_pool
-                if needed in AGENT_CAPABILITIES.get(a.agent_type, frozenset())
-            ]
-            if not candidates:
-                continue
-            chosen, _ = coordinator.assign_task(candidates, task)
-            if chosen is None:
-                continue
-            chosen_task_idx = i
-            chosen_task = task
-            chosen_agent = chosen
-            break
-        if chosen_task_idx is None:
+        # Assign the first pending task to the best-scoring idle cart.
+        task = coordinator.pending_tasks[0]
+        chosen, _ = coordinator.assign_task(idle_pool, task)
+        if chosen is None:
             yield env.timeout(POLL_S)
             continue
-        coordinator.pending_tasks.pop(chosen_task_idx)
-        chosen_agent.last_dispatch_t_s = env.now
-        yield chosen_agent.dispatch_queue.put(chosen_task)
+        coordinator.pending_tasks.pop(0)
+        chosen.last_dispatch_t_s = env.now
+        yield chosen.dispatch_queue.put(task)
 
 
 def _shipping_proc(
@@ -803,7 +767,7 @@ def _dose_tick_proc(
             ):
                 shielded = True
 
-            dose_rate_uSv_h = _estimate_dose_rate_from_activities(item.activities_bq)
+            dose_rate_uSv_h = _representative_dose_rate(item.true_class)
             active.append({
                 "pos": pos,
                 "dose_rate_uSv_h": dose_rate_uSv_h,
@@ -935,6 +899,7 @@ def run_scenario(
     coord = Coordinator(
         shared=(cfg.mode == "hivemind"),
         scrutiny_confidence_threshold=cfg.rescrutiny_confidence_threshold,
+        rng=np.random.default_rng(cfg.seed + 5555),
     )
     coord.packet_drop_probability = cfg.network_drop_probability
     metrics = RunMetrics(mode=cfg.mode)
@@ -953,11 +918,9 @@ def run_scenario(
     # Build waste stream for the actual run
     stream = WasteStream(rng, tricky_fraction=cfg.tricky_fraction)
 
-    # In ISOLATED mode the mobile fleet pulls from shared scan/handle stores
-    # (each agent type fetches from the queue matching its capabilities). In
-    # HIVEMIND mode each agent gets its own dispatch queue and the dispatcher
-    # routes the right kind of task to the right kind of drone.
-    scan_queue = simpy.Store(env)
+    # In ISOLATED mode the mobile fleet pulls transport tasks from one shared
+    # handle_queue. In HIVEMIND mode each cart gets its own dispatch queue and
+    # the coordinator's dispatcher routes each task to the best cart.
     handle_queue = simpy.Store(env)
     rescan_queue = simpy.Store(env)
     # Char station ingress queue — carts drop drums on the turntable and
@@ -968,7 +931,7 @@ def run_scenario(
 
     agents: list[Agent] = []
     home = ZONES_BY_NAME["Charging bay"]
-    # Resolve the fleet composition (Scanner / Handler / Hybrid mix).
+    # Resolve the fleet composition (Handler / Hybrid transport carts).
     fleet = cfg.fleet_composition()
     n_total = len(fleet)
     if n_total == 0:
@@ -982,8 +945,8 @@ def run_scenario(
         spacing = min(1.7, usable / (n_total - 1))
     else:
         spacing = 0.0
-    # Per-role index counters so IDs come out scanner-1 / handler-1 / hybrid-1
-    role_idx = {"scanner": 0, "handler": 0, "hybrid": 0}
+    # Per-role index counters so IDs come out handler-1 / hybrid-1
+    role_idx = {"handler": 0, "hybrid": 0}
     for i, role in enumerate(fleet):
         role_idx[role] += 1
         agent_id = f"{role}-{role_idx[role]}"
@@ -996,29 +959,12 @@ def run_scenario(
         offset = (i - (n_total - 1) / 2.0) * spacing
         a.pos = (home.x + offset, home.y)
         a.home_offset_x = offset
-        # Per-agent dispatch queue in hivemind; None in isolated (so the
-        # agent pulls from scan/handle stores directly, filtered by role).
+        # Per-agent dispatch queue in hivemind; None in isolated (the cart
+        # pulls transport tasks straight from the shared handle_queue).
         if cfg.mode == "hivemind":
             a.dispatch_queue = simpy.Store(env)
         else:
             a.dispatch_queue = None
-        # Isolated mode: bootstrap each scanning-capable agent's classifier
-        # on its own tiny disjoint slice. They never improve from there.
-        # Handlers don't classify, so they don't need a private classifier.
-        if cfg.mode == "isolated" and "scan" in AGENT_CAPABILITIES.get(role, frozenset()):
-            from .sensors import simulate_spectrum, NAI_DETECTOR
-            from .classifier import extract_spectrum_features
-            local_rng = np.random.default_rng(cfg.seed + 500 + i)
-            local_stream = WasteStream(local_rng, tricky_fraction=0.0)
-            feats, labels = [], []
-            for _ in range(15):
-                it = local_stream.generate("Cleanup ops", 0.0)
-                sp = simulate_spectrum(it.activities_bq, 10.0, NAI_DETECTOR, distance_m=0.3, rng=local_rng)
-                feats.append(extract_spectrum_features(sp))
-                labels.append(it.true_class)
-            # Isolated agents fit on non-tricky data and never get an actinide
-            # threshold (no aggregation, so the spike pattern is never learned).
-            a.local_classifier.fit(np.asarray(feats), labels, actinide_threshold=None)
         agents.append(a)
 
     # HPGe drum scanners — TWO redundant stations (HPGe-A primary +
@@ -1057,8 +1003,8 @@ def run_scenario(
     # Launch processes — store the process handle on the agent so an
     # interactive kill can interrupt the running task immediately.
     for a in agents:
-        a.proc = env.process(a.run(scan_queue, handle_queue, rescan_queue))
-    env.process(_waste_generator_proc(env, stream, scan_queue, handle_queue,
+        a.proc = env.process(a.run(handle_queue, rescan_queue))
+    env.process(_waste_generator_proc(env, stream, handle_queue,
                                        coord, cfg, active_items, rng))
     env.process(_dose_tick_proc(env, metrics, coord, active_items, agents, cfg))
     # Spin up one generator process per upstream PUREX stage so each
@@ -1072,17 +1018,34 @@ def run_scenario(
     }
     upstream_stream_rng = np.random.default_rng(cfg.seed + 2024)
     upstream_stream = WasteStream(upstream_stream_rng, tricky_fraction=cfg.tricky_fraction * 0.5)
-    for z in generation_points():
+    # NOTE: per-stage RNG seeds are derived from a stable enumeration index,
+    # NOT from hash(z.name) — Python salts string hashing per process, which
+    # made `--seed N` produce a different scenario on every launch.
+    for stage_i, z in enumerate(generation_points()):
         if z.produces_class is None:
             continue  # legacy contact-handling sources, handled above
         cadence = upstream_cadence_s.get(z.name, cfg.waste_interarrival_mean_s * 4.0)
         is_hlw = (z.produces_class == "HLW")
         env.process(_process_stage_generator_proc(
-            env, z, upstream_stream, scan_queue, handle_queue, coord, cfg,
+            env, z, upstream_stream, handle_queue, coord, cfg,
             active_items,
-            rng=np.random.default_rng(cfg.seed + 3000 + hash(z.name) % 1000),
+            rng=np.random.default_rng(cfg.seed + 3000 + stage_i),
             mean_interarrival_s=cadence,
             process_known=is_hlw,
+        ))
+    # Spent Fuel Pool waste source — filters / sludge / contaminated tools, a
+    # mixed contact-waste stream on a slow cadence. This is what makes the
+    # plant's visual origin (the pool) actually feed the Classifier, instead
+    # of being decorative. produces_class is None -> normal mixed stream that
+    # goes through the central scan like the legacy contact sources.
+    pool_zone = ZONES_BY_NAME.get(POOL_SOURCE_NAME)
+    if pool_zone is not None:
+        env.process(_process_stage_generator_proc(
+            env, pool_zone, upstream_stream, handle_queue, coord, cfg,
+            active_items,
+            rng=np.random.default_rng(cfg.seed + 3900),
+            mean_interarrival_s=max(cfg.waste_interarrival_mean_s * 2.5, 150.0),
+            process_known=False,
         ))
     if workers:
         env.process(_worker_wander_proc(env, workers, worker_rng, coord))
@@ -1093,7 +1056,6 @@ def run_scenario(
     env.process(_char_station_actuator_proc(
         env, coord, metrics,
         rng=np.random.default_rng(cfg.seed + 4242),
-        scan_queue=scan_queue,
         handle_queue=handle_queue,
         qa_sampling_fraction=cfg.qa_sampling_fraction,
     ))
@@ -1132,8 +1094,7 @@ def run_scenario(
         ctx = TickContext(
             env=env, agents=agents, metrics=metrics, coord=coord,
             active_items=active_items, stream=stream,
-            scan_queue=scan_queue, handle_queue=handle_queue,
-            rescan_queue=rescan_queue,
+            handle_queue=handle_queue, rescan_queue=rescan_queue,
             cfg=cfg, workers=workers, sim_duration_s=cfg.sim_duration_s,
             arm_pairs=arm_pairs, arm_events=arm_events,
             shift_events=shift_events,

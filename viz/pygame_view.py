@@ -24,7 +24,7 @@ from pathlib import Path
 import pygame
 
 from sim.facility import (
-    ZONES, ZONES_BY_NAME, WIDTH_M, HEIGHT_M,
+    ZONES, ZONES_BY_NAME, WIDTH_M, HEIGHT_M, drum_source_zones,
 )
 
 ICON_PATH = Path(__file__).parent.parent / "assets" / "horus_icon.png"
@@ -65,19 +65,14 @@ OK          = (130, 220, 130)
 
 # Class colors — match the dashboard
 # Plain-English captions for agent states. Keeps the label pill readable
-# to a non-engineer audience: an AGV doesn't say "ACQUIRING", it says
-# "scanning gamma" — the actual physics step a nuclear pro recognises.
+# to a non-engineer audience. Carts are transports (pickup/dropoff/charge/
+# decon); only the fixed HPGe station rescans.
 STATE_CAPTION = {
     "IDLE":                "idle",
     "MOVING_TO_PICKUP":    "→ pickup",
     "PICKING_UP":          "loading drum",
-    "MOVING_TO_SORTING":   "→ scan station",
-    "ACQUIRING":           "scanning gamma",
-    "CLASSIFYING":         "matching peaks",
-    "REPORTING":           "→ coordinator",
     "MOVING_TO_DROPOFF":   "→ dropoff",
     "DROPPING_OFF":        "unloading",
-    "MOVING_TO_RESCAN":    "→ QA lab",
     "RESCANNING":          "HPGe rescan",
     "RETURNING_TO_CHARGE": "→ charging bay",
     "CHARGING":            "charging",
@@ -122,13 +117,8 @@ STATE_COLOR = {
     "IDLE":                  (110, 200, 130),
     "MOVING_TO_PICKUP":      (110, 180, 230),
     "PICKING_UP":            (160, 200, 230),
-    "MOVING_TO_SORTING":     (110, 180, 230),
-    "ACQUIRING":             (230, 170, 90),
-    "CLASSIFYING":           (200, 130, 220),
-    "REPORTING":             (220, 140, 200),
     "MOVING_TO_DROPOFF":     (110, 180, 230),
     "DROPPING_OFF":          (160, 200, 230),
-    "MOVING_TO_RESCAN":      (250, 160, 100),
     "RESCANNING":            (255, 200, 120),
     "RETURNING_TO_CHARGE":   (150, 200, 230),
     "CHARGING":              (120, 220, 255),
@@ -157,16 +147,11 @@ ROLE_OUTLINE = {
 # Per-AGENT-TYPE chassis profile used by the pygame renderer.
 #   length_m / width_m : chassis dimensions in world metres (the chassis is
 #                        drawn as a rotated rounded rectangle of this size).
-#   mast               : Scanner-style sensor mast + camera dome on top.
+#   mast               : sensor mast + camera dome on top.
 #   fork               : Handler-style gripper fork prongs at the front.
 #   accent             : role-identifying colour band painted across the
 #                        chassis so judges can spot roles at a glance.
 AGENT_PROFILE = {
-    "scanner": {
-        "length_m": 0.65, "width_m": 0.50,
-        "mast": True, "fork": False,
-        "accent": (110, 200, 255),   # cyan — "sensors"
-    },
     "handler": {
         "length_m": 1.00, "width_m": 0.70,
         "mast": False, "fork": True,
@@ -218,8 +203,29 @@ class LiveView:
                 pygame.display.set_icon(pygame.image.load(str(ICON_PATH)))
             except pygame.error:
                 pass
-        self.screen = pygame.display.set_mode((WINDOW_W, WINDOW_H))
+        # Open as a normal, resizable window sized to (most of) the desktop —
+        # "full size" windowed, NOT exclusive fullscreen, so the OS title bar
+        # / menu bar stay visible and the window can be moved or resized. All
+        # layout math stays at the fixed design size by drawing to an
+        # offscreen canvas (`self.screen`) and letterbox-scaling it onto the
+        # window each frame, so nothing stretches at any window size.
+        info = pygame.display.Info()
+        # Leave headroom for the title bar + menu bar / taskbar so the whole
+        # window stays reachable; clamp to sane minimums.
+        win_w = max(800, info.current_w)
+        win_h = max(600, info.current_h - 100)
+        os.environ.setdefault("SDL_VIDEO_CENTERED", "1")
+        self.display = pygame.display.set_mode((win_w, win_h), pygame.RESIZABLE)
+        self.screen = pygame.Surface((WINDOW_W, WINDOW_H))
+        self._recompute_present()
         pygame.display.set_caption(self.title)
+        # Vertical stagger for zone-name captions in the tightly-packed top
+        # row (the PUREX chain), so long names like "Dissolution cell",
+        # "Solvent extraction" and "HLW concentration" don't collide
+        # horizontally. Alternating rooms (left→right) drop their caption one
+        # line so neighbours are never on the same baseline.
+        _top_band = sorted((z for z in ZONES if z.y < 6.0), key=lambda z: z.x)
+        self._caption_stagger = {z.name: (i % 2) for i, z in enumerate(_top_band)}
         self.font_xs   = pygame.font.SysFont("Menlo, Consolas, monospace", 11)
         self.font_s    = pygame.font.SysFont("Menlo, Consolas, monospace", 13)
         self.font_m    = pygame.font.SysFont("Menlo, Consolas, monospace", 14, bold=True)
@@ -257,7 +263,7 @@ class LiveView:
         # the current mode with the live fleet config when set.
         self.restart_requested: bool = False
         self.help_open: bool = False
-        self.live_fleet: dict[str, int] = {"scanner": 2, "handler": 3, "hybrid": 1}
+        self.live_fleet: dict[str, int] = {"handler": 5, "hybrid": 1}
         # Snapshot of `live_fleet` as it was when the current mode started.
         # `live_fleet` becomes the *pending* config when the user adjusts
         # it with F / [ / ]; we render a header banner whenever the two
@@ -293,21 +299,19 @@ class LiveView:
 
     # Preset fleet compositions for the F-cycle key.
     _FLEET_PRESETS = [
-        {"scanner": 1, "handler": 2, "hybrid": 1},   # minimal
-        {"scanner": 2, "handler": 3, "hybrid": 1},   # default
-        {"scanner": 3, "handler": 4, "hybrid": 2},   # large
-        {"scanner": 4, "handler": 5, "hybrid": 2},   # max
-        {"scanner": 0, "handler": 0, "hybrid": 5},   # all-hybrid (legacy)
+        {"handler": 3, "hybrid": 1},   # minimal
+        {"handler": 5, "hybrid": 1},   # default
+        {"handler": 6, "hybrid": 2},   # large
+        {"handler": 8, "hybrid": 2},   # max
+        {"handler": 0, "hybrid": 5},   # all-hybrid (legacy)
     ]
 
     def _cycle_fleet_preset(self) -> None:
         # Find the current preset index, advance one
-        current = (self.live_fleet["scanner"],
-                   self.live_fleet["handler"],
-                   self.live_fleet["hybrid"])
+        current = (self.live_fleet["handler"], self.live_fleet["hybrid"])
         idx = 0
         for i, p in enumerate(self._FLEET_PRESETS):
-            if (p["scanner"], p["handler"], p["hybrid"]) == current:
+            if (p["handler"], p["hybrid"]) == current:
                 idx = i
                 break
         nxt = self._FLEET_PRESETS[(idx + 1) % len(self._FLEET_PRESETS)]
@@ -317,17 +321,11 @@ class LiveView:
         """Grow or shrink the cart fleet by one. Redistributes the new
         total as 70% handlers + 30% hybrids (mix that runs well with
         the centralized-classifier model). Clamped 1..12."""
-        total = (self.live_fleet["scanner"]
-                 + self.live_fleet["handler"]
-                 + self.live_fleet["hybrid"])
+        total = self.live_fleet["handler"] + self.live_fleet["hybrid"]
         total = max(1, min(12, total + delta))
         n_handlers = max(1, int(round(total * 0.7)))
         n_hybrids = max(0, total - n_handlers)
-        self.live_fleet = {
-            "scanner": 0,
-            "handler": n_handlers,
-            "hybrid": n_hybrids,
-        }
+        self.live_fleet = {"handler": n_handlers, "hybrid": n_hybrids}
 
     def on_tick(self, ctx) -> bool:
         """Called by scenario.run_scenario once per simulated step.
@@ -341,8 +339,27 @@ class LiveView:
         self.clock.tick(self.target_fps)
         self._collect_events(ctx)
         self._draw(ctx)
-        pygame.display.flip()
+        self._present()
         return True
+
+    def _recompute_present(self):
+        """Recompute the letterbox scale + offset for the current window size.
+        Called on init and whenever the window is resized."""
+        dw, dh = self.display.get_size()
+        scale = min(dw / WINDOW_W, dh / WINDOW_H)
+        self._present_size = (int(WINDOW_W * scale), int(WINDOW_H * scale))
+        self._present_offset = (
+            (dw - self._present_size[0]) // 2,
+            (dh - self._present_size[1]) // 2,
+        )
+
+    def _present(self):
+        """Scale the offscreen canvas to the window, centered and
+        letterboxed so the design aspect ratio is preserved at any size."""
+        self.display.fill((0, 0, 0))
+        scaled = pygame.transform.smoothscale(self.screen, self._present_size)
+        self.display.blit(scaled, self._present_offset)
+        pygame.display.flip()
 
     def close(self):
         pygame.quit()
@@ -353,6 +370,13 @@ class LiveView:
         for e in pygame.event.get():
             if e.type == pygame.QUIT:
                 self.closed = True
+            elif e.type == pygame.VIDEORESIZE:
+                # User dragged the window edge / maximized — re-create the
+                # display at the new size and recompute the letterbox fit.
+                self.display = pygame.display.set_mode(
+                    (max(e.w, 320), max(e.h, 240)), pygame.RESIZABLE,
+                )
+                self._recompute_present()
             elif e.type == pygame.KEYDOWN:
                 if e.key in (pygame.K_q, pygame.K_ESCAPE):
                     self.closed = True
@@ -412,7 +436,6 @@ class LiveView:
                     self.events.append(LogEvent(
                         ctx.env.now,
                         f"[USER] fleet preset → "
-                        f"{self.live_fleet['scanner']}sc / "
                         f"{self.live_fleet['handler']}hd / "
                         f"{self.live_fleet['hybrid']}hy "
                         "(press X to apply)",
@@ -794,7 +817,6 @@ class LiveView:
         if self.live_fleet != self.applied_fleet:
             pending_msg = (
                 f"FLEET PENDING — staged: "
-                f"{self.live_fleet['scanner']}sc / "
                 f"{self.live_fleet['handler']}hd / "
                 f"{self.live_fleet['hybrid']}hy   "
                 f"(press X to apply)"
@@ -1036,11 +1058,9 @@ class LiveView:
         char_pos = (char_z.x, char_z.y - char_z.radius_m * 0.6)
         now_ms = pygame.time.get_ticks()
         layer = pygame.Surface((FACILITY_W, FACILITY_H), pygame.SRCALPHA)
-        # Find waste-emitting cells: generation role only (process /
-        # solidification / pool are not direct drum sources for our pipeline)
-        for z in ZONES:
-            if z.role != "generation":
-                continue
+        # Every waste-emitting cell feeds the one Classifier: the generation
+        # cells plus the Spent Fuel Pool (see facility.drum_source_zones).
+        for z in drum_source_zones():
             src_pos = (z.x, z.y + z.radius_m * 0.6)
             sx, sy = self.world_to_screen(src_pos)
             ex, ey = self.world_to_screen(char_pos)
@@ -1083,10 +1103,11 @@ class LiveView:
 
         Idle markers are dim; markers currently being scanned by a cart
         pulse cyan with a faint trace toward the AI BRAIN to suggest the
-        telemetry signal. The faint thin lines linking adjacent markers
-        are the actual graph edges — judges can see the routing network
-        the carts move on."""
-        from sim.facility import waypoints, waypoint_edges
+        telemetry signal. (The full waypoint-graph edge mesh used to be
+        drawn here too, but it crisscrossed the whole floor and buried the
+        actual material-flow story — removed for legibility. The carts still
+        route on that graph; it's just no longer painted.)"""
+        from sim.facility import waypoints
         markers = waypoints()
 
         cart_positions = [
@@ -1099,26 +1120,7 @@ class LiveView:
             (coord_zone.x, coord_zone.y)
         ) if coord_zone is not None else None
 
-        # 1) Faint network lines on a translucent layer — these are the
-        # waypoint graph edges. Drawn first so QR glyphs sit on top.
-        net_layer = pygame.Surface((FACILITY_W, FACILITY_H), pygame.SRCALPHA)
-        edges = waypoint_edges()
-        seen: set[tuple[int, int]] = set()
-        for i, nbrs in edges.items():
-            for j, _cost in nbrs:
-                key = (i, j) if i < j else (j, i)
-                if key in seen:
-                    continue
-                seen.add(key)
-                ax, ay = self.world_to_screen(markers[i])
-                bx, by = self.world_to_screen(markers[j])
-                pygame.draw.line(
-                    net_layer, (60, 110, 160, 60),
-                    (ax, ay - HEADER_H), (bx, by - HEADER_H), 1,
-                )
-        self.screen.blit(net_layer, (0, HEADER_H))
-
-        # 2) Markers themselves.
+        # Markers themselves (no edge mesh — see docstring).
         active_markers: list[tuple[int, int]] = []
         dim_layer = pygame.Surface((FACILITY_W, FACILITY_H), pygame.SRCALPHA)
         for (x, y) in markers:
@@ -1134,7 +1136,7 @@ class LiveView:
                                     (160, 240, 255), bright=True)
             else:
                 self._draw_qr_glyph(dim_layer, sx, sy - HEADER_H,
-                                    (130, 180, 220, 180), bright=False)
+                                    (110, 150, 190, 90), bright=False)
         self.screen.blit(dim_layer, (0, HEADER_H))
 
         # Telemetry trace: thin faint line from each active marker to the
@@ -1344,9 +1346,11 @@ class LiveView:
         self.screen.blit(tag_bg, (x + 2, y + 2))
         self.screen.blit(tag, (x + 5, y + 3))
 
-        # Full zone name UNDER the room
+        # Full zone name UNDER the room. In the top PUREX row, alternate rooms
+        # drop one line (see _caption_stagger) so long names don't collide.
         full = self.font_xs.render(z.name, True, TEXT)
-        self.screen.blit(full, (x + w // 2 - full.get_width() // 2, y + h + 4))
+        cap_y = y + h + 4 + self._caption_stagger.get(z.name, 0) * (full.get_height() + 1)
+        self.screen.blit(full, (x + w // 2 - full.get_width() // 2, cap_y))
 
     def _draw_fuel_pool_interior(self, x: int, y: int, w: int, h: int, ctx):
         """Spent Fuel Pool: a water-filled basin where spent fuel assemblies
@@ -1634,21 +1638,23 @@ class LiveView:
                     break
         turntable_y = y + h - 14
         tt_radius = 8
+        # Short station tags so the three labels don't overlap in the narrow
+        # room: drum comes IN, gets SCANned (NaI + CV), is routed OUT.
         stations = (
-            ("INTAKE",   0.22),
-            ("MEASURE",  0.50),
-            ("DISPATCH", 0.78),
+            ("IN",   0.22),
+            ("SCAN", 0.50),
+            ("OUT",  0.78),
         )
         for idx, (label, fx) in enumerate(stations):
             tt_x = x + int(w * fx)
             # Plate
-            ring_col = (140, 220, 200) if label == "MEASURE" else (200, 170, 100)
+            ring_col = (140, 220, 200) if label == "SCAN" else (200, 170, 100)
             pygame.draw.circle(self.screen, (40, 50, 70), (tt_x, turntable_y),
                                tt_radius, 0)
             pygame.draw.circle(self.screen, ring_col, (tt_x, turntable_y),
                                tt_radius, 2)
-            # Spinning tick when MEASURE has a drum
-            if label == "MEASURE" and has_drum:
+            # Spinning tick when the SCAN station has a drum
+            if label == "SCAN" and has_drum:
                 ang = now_ms / 600.0
                 tx = tt_x + int((tt_radius - 2) * math.cos(ang))
                 ty = turntable_y + int((tt_radius - 2) * math.sin(ang))
@@ -2038,12 +2044,14 @@ class LiveView:
 
     def _compute_gen_queues(self, ctx) -> dict[str, int]:
         """Items waiting for pickup, grouped by their pickup zone. Counts
-        across both the scan queue (untriaged) and the handle queue
-        (classified but not yet transported)."""
+        transport tasks not yet assigned to a cart — the shared handle_queue
+        (isolated mode) plus the coordinator's pending pool (hivemind)."""
         counts: dict[str, int] = {}
-        for task in list(ctx.scan_queue.items) + list(ctx.handle_queue.items):
-            zone = task["pickup_zone"]
-            counts[zone.name] = counts.get(zone.name, 0) + 1
+        pending = list(ctx.handle_queue.items) + list(ctx.coord.pending_tasks)
+        for task in pending:
+            zone = task.get("pickup_zone")
+            if zone is not None:
+                counts[zone.name] = counts.get(zone.name, 0) + 1
         return counts
 
     def _compute_storage_counts(self, ctx) -> dict[str, int]:
@@ -2616,17 +2624,21 @@ class LiveView:
         extends to the cart, grabs the drum, and lifts it into the zone.
         Otherwise it parks in a folded pose."""
         # (zone_name, anchor_side: -1 = left edge / +1 = right edge,
-        #  active_states_for_this_zone)
+        #  active_states, anchor_mode)
+        # Storage arms anchor on the RIGHT edge so they sit opposite the class
+        # label (drawn top-left inside each box) instead of covering it. The
+        # Free-release box is small, so its arm anchors at the BOTTOM, tucked
+        # under the "CLEAR" label rather than beside it.
         loader_zones = [
-            ("VLLW storage",   -1, ("DROPPING_OFF",)),
-            ("LLW storage",    -1, ("DROPPING_OFF",)),
-            ("ILW storage",    -1, ("DROPPING_OFF",)),
-            ("HLW storage",    -1, ("DROPPING_OFF",)),
-            ("Free release",   -1, ("DROPPING_OFF",)),
-            ("Classifier",   +1, ("DROPPING_OFF", "PICKING_UP")),
+            ("VLLW storage",   +1, ("DROPPING_OFF",), "side"),
+            ("LLW storage",    +1, ("DROPPING_OFF",), "side"),
+            ("ILW storage",    +1, ("DROPPING_OFF",), "side"),
+            ("HLW storage",    +1, ("DROPPING_OFF",), "side"),
+            ("Free release",   +1, ("DROPPING_OFF",), "bottom"),
+            ("Classifier",     +1, ("DROPPING_OFF", "PICKING_UP"), "side"),
         ]
         now_ms = pygame.time.get_ticks()
-        for zone_name, side, active_states in loader_zones:
+        for zone_name, side, active_states, anchor_mode in loader_zones:
             z = ZONES_BY_NAME.get(zone_name)
             if z is None:
                 continue
@@ -2642,11 +2654,15 @@ class LiveView:
                 target_agent = a
                 break
 
-            # Anchor: top corner of the zone on the cart-facing side
-            anchor_world = (
-                z.x + side * z.radius_m * 0.85,
-                z.y - z.radius_m * 0.55,
-            )
+            # Anchor: usually the top corner on the cart-facing side; in
+            # "bottom" mode (the small CLEAR box) it tucks under the label.
+            if anchor_mode == "bottom":
+                anchor_world = (z.x, z.y + z.radius_m * 0.45)
+            else:
+                anchor_world = (
+                    z.x + side * z.radius_m * 0.85,
+                    z.y - z.radius_m * 0.55,
+                )
             sx, sy = self.world_to_screen(anchor_world)
             L1_px = z.radius_m * 0.7 * PX_PER_M
             L2_px = z.radius_m * 0.7 * PX_PER_M
@@ -3076,9 +3092,8 @@ class LiveView:
 
     def _draw_agent_chassis(self, a, cx: int, cy: int, state_color: tuple):
         """Render the agent body as a role-specific AGV chassis facing the
-        agent's heading. Scanners are small with a sensor mast; Handlers
-        are bigger with forklift prongs; Hybrids carry both. The chassis
-        is tinted by the agent's current state (so a moving handler still
+        agent's heading. Handlers have forklift prongs; Hybrids add a sensor
+        mast. The chassis is tinted by the agent's current state (so a moving handler still
         shows its 'moving' colour) but always carries a role-coloured
         accent band so judges can tell what each drone is at a glance."""
         prof = AGENT_PROFILE.get(a.agent_type, AGENT_PROFILE["hybrid"])
@@ -3118,8 +3133,8 @@ class LiveView:
         band_b = rot(L_px * 0.25,  W_px * 0.9)
         pygame.draw.line(self.screen, accent, band_a, band_b, 3)
 
-        # Sensor mast (scanners + hybrids + qa lab): a small pole rising
-        # above the chassis with a camera dome at the top.
+        # Sensor mast (hybrids + qa lab): a small pole rising above the
+        # chassis with a camera dome at the top.
         if prof["mast"]:
             mast_base = rot(L_px * 0.1, 0)
             mast_top  = rot(L_px * 0.1 + W_px * 1.4, 0)
@@ -3140,7 +3155,7 @@ class LiveView:
 
         # Subtle headlight pair on the front of the chassis when moving
         # (suggests the cart is actively traversing).
-        if a.state.startswith("MOVING_") or a.state == "ACQUIRING":
+        if a.state.startswith("MOVING_"):
             for side in (-1, 1):
                 hl = rot(L_px * 0.95, W_px * 0.6 * side)
                 pygame.draw.circle(self.screen, (255, 240, 200),
@@ -3306,10 +3321,9 @@ class LiveView:
             # charging bay don't overlap each other; while active we use a
             # two-line pill with the full ID + state.
             if a.state == "IDLE":
-                # Short ID by role prefix: scanner-N -> sN, handler-N -> hN,
-                # hybrid-N -> yN, qa-lab-N -> qlN.
+                # Short ID by role prefix: handler-N -> hN, hybrid-N -> yN,
+                # qa-lab-N -> qlN.
                 prefix_map = {
-                    "scanner-": "s",
                     "handler-": "h",
                     "hybrid-":  "y",
                     "qa-lab-":  "ql",
@@ -3360,19 +3374,11 @@ class LiveView:
             if not a.is_rescrutiny_station:
                 self._draw_health_bars(cx, cy + radius + 4, a)
 
-            # Live sensor widgets when the agent is mid-classification.
-            # ACQUIRING shows the gamma + camera streams; CLASSIFYING shows
-            # a "thinking" pulse — these make it visually obvious what the
-            # robot is doing on board.
-            if a.state == "ACQUIRING":
-                self._draw_sensor_widget(cx, cy, a)
-                self._draw_classification_callout(a, cx, cy, "Scanning NaI gamma…")
-            elif a.state == "CLASSIFYING":
-                self._draw_thinking_pulse(cx, cy)
-                self._draw_classification_callout(a, cx, cy, "Matching photopeaks…")
-            elif a.state == "REPORTING":
-                self._draw_classification_callout(a, cx, cy, "Reporting → coordinator")
-            elif a.state == "RESCANNING":
+            # The QA-lab HPGe station is the only unit that classifies on the
+            # floor; show its gamma stream + callout while it integrates.
+            # (Mobile carts are transports — classification is done centrally
+            # at the Char Station, not on the cart.)
+            if a.state == "RESCANNING":
                 self._draw_sensor_widget(cx, cy, a, hpge=True)
                 self._draw_classification_callout(a, cx, cy,
                                                   "HPGe 60s integration", hpge=True)
@@ -3389,8 +3395,6 @@ class LiveView:
         item_id = None
         if a.is_rescrutiny_station and a.carrying is not None:
             item_id = a.carrying.item_id
-        elif getattr(a, "scanning_item", None) is not None:
-            item_id = a.scanning_item.item_id
         accent = (140, 220, 255) if hpge else (200, 230, 255)
         # Compose the callout text
         text = caption
@@ -3576,18 +3580,6 @@ class LiveView:
             y += 13
         return y + 2
 
-    def _draw_thinking_pulse(self, cx: int, cy: int):
-        """Three dots pulsing in sequence, drawn above the agent body —
-        the universal 'thinking' affordance."""
-        t = pygame.time.get_ticks()
-        for i in range(3):
-            phase = (t / 200 + i) % 3
-            scale = 0.4 + 0.6 * max(0.0, 1.0 - abs(phase - 1.5))
-            size = int(2 + 3 * scale)
-            x = cx + (i - 1) * 9
-            y = cy - 30
-            pygame.draw.circle(self.screen, (200, 130, 220), (x, y), size, 0)
-
     def _draw_health_bars(self, cx: int, cy: int, a):
         """Two thin bars: battery (green→amber→red) and integrated dose
         (transparent → red). Stacked vertically under the agent body."""
@@ -3645,7 +3637,7 @@ class LiveView:
         pending = len(ctx.coord.pending_tasks)
         from collections import Counter
         role_counts = Counter(a.agent_type for a in mobile)
-        ROLE_ABBR = {"scanner": "sc", "handler": "hd", "hybrid": "hy"}
+        ROLE_ABBR = {"handler": "hd", "hybrid": "hy"}
         role_summary = " / ".join(
             f"{n}{ROLE_ABBR.get(t, t[:2])}"
             for t, n in sorted(role_counts.items()) if n > 0
@@ -3695,32 +3687,37 @@ class LiveView:
         self.screen.blit(kt, (x0 + 14, y))
         self.screen.blit(vt, (x0 + 130, y))
         y += 14
+        # Arm pairs: in the common (all-nominal) case collapse to a single
+        # summary line. Only list a pair individually when it's degraded or
+        # down, so a failover during the demo still stands out instead of
+        # being buried in six "X active" rows.
         total_arm_failovers = 0
         any_down = False
+        degraded = []
         for key, pair in arm_pairs.items():
             total_arm_failovers += pair.failover_count
             active = pair.active_idx()
             if active is None:
-                status = "BOTH DOWN"
-                col = DANGER
+                degraded.append((pair.name, "BOTH DOWN", DANGER))
                 any_down = True
             elif pair.failed_units:
-                # One unit down, standby is leading.
-                status = f"{pair.units[active]} active (1 in repair)"
-                col = WARN
-            else:
-                status = f"{pair.units[active]} active"
-                col = OK
-            kt = self.font_s.render(pair.name, True, DIM_TEXT)
-            vt = self.font_s.render(status, True, col)
-            # Truncate value if it overflows
-            max_w = PANEL_W - 130 - 18
-            while self.font_s.size(status)[0] > max_w and len(status) > 4:
-                status = status[:-2]
-                vt = self.font_s.render(status, True, col)
+                degraded.append((pair.name,
+                                 f"{pair.units[active]} active (1 in repair)", WARN))
+        n_pairs = len(arm_pairs)
+        if not degraded:
+            kt = self.font_s.render("arm pairs", True, DIM_TEXT)
+            vt = self.font_s.render(f"{n_pairs}/{n_pairs} nominal (A+B)", True, OK)
             self.screen.blit(kt, (x0 + 14, y))
             self.screen.blit(vt, (x0 + 130, y))
             y += 14
+        else:
+            max_w = PANEL_W - 130 - 18
+            for name, status, col in degraded:
+                while self.font_s.size(status)[0] > max_w and len(status) > 4:
+                    status = status[:-2]
+                self.screen.blit(self.font_s.render(name, True, DIM_TEXT), (x0 + 14, y))
+                self.screen.blit(self.font_s.render(status, True, col), (x0 + 130, y))
+                y += 14
 
         # Total integrated downtime — sum of `total_downtime_s` across
         # all pairs, plus any currently-open BOTH-DOWN windows. Stays at
@@ -3848,11 +3845,9 @@ class LiveView:
             ("LLW",  CLASS_COLOR["LLW"]),
             ("ILW",  CLASS_COLOR["ILW"]),
             ("HLW",  CLASS_COLOR["HLW"]),
-            ("Scanner", AGENT_PROFILE["scanner"]["accent"]),
             ("Handler", AGENT_PROFILE["handler"]["accent"]),
             ("Hybrid",  AGENT_PROFILE["hybrid"]["accent"]),
             ("moving",        STATE_COLOR["MOVING_TO_PICKUP"]),
-            ("acquiring",     STATE_COLOR["ACQUIRING"]),
             ("rescan (HPGe)", STATE_COLOR["RESCANNING"]),
         ]
         x = 16

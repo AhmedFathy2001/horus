@@ -29,17 +29,18 @@ from .facility import (
     shortest_waypoint_path,
 )
 from .sensors import (
-    simulate_spectrum, simulate_dose_rate, simulate_cv_classification,
-    NAI_DETECTOR, HPGE_DETECTOR,
+    simulate_spectrum, simulate_dose_rate, HPGE_DETECTOR,
 )
 from .waste_generator import WasteItem
 
 
+# Cart states are all transport/health states; the fixed HPGe station adds
+# RESCANNING. Classification happens centrally at the Char Station, so no cart
+# has a scan/classify state.
 AGENT_STATES = (
     "IDLE", "MOVING_TO_PICKUP", "PICKING_UP",
-    "MOVING_TO_SORTING", "ACQUIRING", "CLASSIFYING", "REPORTING",
     "MOVING_TO_DROPOFF", "DROPPING_OFF",
-    "MOVING_TO_RESCAN", "RESCANNING",
+    "RESCANNING",
     "RETURNING_TO_CHARGE", "CHARGING",
     "RETURNING_TO_DECON", "DECONNING",
     "FAILED",
@@ -92,14 +93,6 @@ HPGE_ERROR_RATE        = 0.02
 WORKER_ERROR_RATE      = 0.01    # operator's own slip-up rate
 WORKER_DETECTION_RATE  = 0.70    # P(operator catches an HPGe error)
 
-# Cart-side process noise. Even on "easy" drums the cart's NaI + CV
-# classification picks up rare errors from sources we don't model in
-# detail: container labeling mistakes, paperwork mix-ups, ambient
-# gamma background spikes, brief calibration drift. ~1% off-by-one
-# every now and then makes the demo honest — no system is 100% even
-# for items that LOOK obvious to the gamma spectrometer.
-CART_ERROR_RATE = 0.01
-
 # Class order for the "off-by-one" misclassification shift. We never
 # jump multiple boundaries — a real HPGe-grade assay doesn't confuse
 # VLLW with HLW; it just occasionally crosses a single class boundary.
@@ -118,26 +111,26 @@ def _shift_one_class(c: str, rng) -> str:
         return _CLASS_ORDER[-2]
     return _CLASS_ORDER[idx + (1 if rng.random() < 0.5 else -1)]
 
-# Per-role chassis profile. Scanners are small/fast (sensor swarm); Handlers
-# are big/slow (gripper + drum). Hybrids sit in the middle.
+# Per-role chassis profile. Classification is centralised at the Char Station,
+# so every mobile cart is a transport AGV — they only differ by chassis:
+# Handlers are heavier/slower, Hybrids a touch quicker. (The "scanner" role is
+# gone — with one central classifier there's nothing for a roaming sensor cart
+# to do.)
 AGENT_TYPE_SPEED_MPS = {
-    "scanner": 1.30,
     "handler": 0.85,
     "hybrid":  1.00,
     "qa_lab":  0.0,
 }
 AGENT_CAPABILITIES = {
-    "scanner": frozenset({"scan"}),
     "handler": frozenset({"handle"}),
-    "hybrid":  frozenset({"scan", "handle"}),
+    "hybrid":  frozenset({"handle"}),
     "qa_lab":  frozenset({"rescan"}),
 }
-# Per-role agility profile. Scanners are nimble (looser curves, more jitter
-# — they're sensor swarmers darting between drums). Handlers are heavy and
-# move in deliberate straight-ish lines so the gripper-loaded drum doesn't
-# slosh. Numbers are tuning knobs for the path-shape, not physical units.
+# Per-role agility profile. Handlers are heavy and move in deliberate
+# straight-ish lines so the gripper-loaded drum doesn't slosh; Hybrids are a
+# little nimbler. Numbers are tuning knobs for the path-shape, not physical
+# units.
 AGENT_TYPE_AGILITY = {
-    "scanner": {"curve_amp_m_per_m": 0.12, "max_curve_m": 0.8, "jitter_sigma_m": 0.06},
     "handler": {"curve_amp_m_per_m": 0.04, "max_curve_m": 0.3, "jitter_sigma_m": 0.02},
     "hybrid":  {"curve_amp_m_per_m": 0.08, "max_curve_m": 0.6, "jitter_sigma_m": 0.05},
     "qa_lab":  {"curve_amp_m_per_m": 0.0,  "max_curve_m": 0.0, "jitter_sigma_m": 0.0},
@@ -177,12 +170,10 @@ class Agent:
         self.is_rescrutiny_station = is_rescrutiny_station
         self.qa_sampling_fraction = qa_sampling_fraction
         # Robot role:
-        #   "scanner" — NaI + camera only, no gripper. Visits items in-place
-        #               at gen points, classifies, reports. Does NOT carry.
-        #   "handler" — gripper + chassis, minimal sensors. Picks up items
-        #               whose class is already known and routes to storage.
-        #   "hybrid"  — both: can scan AND handle (the original sim behavior).
-        #   "qa_lab"  — fixed HPGe drum scanner station (rescrutiny only).
+        #   "handler" — gripper + chassis transport AGV. Picks up drums and
+        #               ferries them: gen point -> Char Station -> storage/QA.
+        #   "hybrid"  — same job, slightly quicker chassis.
+        #   "qa_lab"  — fixed HPGe drum-scanner station (rescrutiny only).
         if is_rescrutiny_station:
             agent_type = "qa_lab"
         self.agent_type: str = agent_type
@@ -204,8 +195,8 @@ class Agent:
         self.last_decon_t_s: float = 0.0
         self.dose_at_last_decon_uSv: float = 0.0
         self.handled_hot_since_decon: bool = False
-        # Initial facing south (π/2) so the FOV cone at the charging bay
-        # already covers the work area; gets updated as soon as the agent moves
+        # Heading in radians; updated as the cart moves so the chassis sprite
+        # points the right way.
         self.facing_rad: float = math.pi / 2
         # Timestamps used by the live view for OFFLINE / SPAWN animations
         self.failure_time_s: float | None = None
@@ -213,14 +204,9 @@ class Agent:
         # When the dispatcher assigns this agent a task, store the timestamp
         # so the live view can show a dispatch indicator briefly
         self.last_dispatch_t_s: float | None = None
-        # During ACQUIRING, the live view uses this to draw the deployable
-        # classification arm reaching out to the actual drum being scanned.
-        # Cleared when the scanner moves on.
-        self.scanning_item: "WasteItem | None" = None
-        self.scanning_zone_name: str | None = None
         # Set by the scenario builder: where this agent pulls tasks from.
         # In HIVEMIND it's a per-agent simpy.Store; in ISOLATED it's the
-        # shared task_queue. Defaults to None until the scenario sets it.
+        # shared handle_queue. Defaults to None until the scenario sets it.
         self.dispatch_queue = None
 
     def runtime_state(self) -> AgentRuntimeState:
@@ -391,10 +377,12 @@ class Agent:
         all dropping off at Quick scan / LLW storage in the same window).
 
         Each drone gets a stable angular slot around the zone centre,
-        keyed off a hash of its agent_id so spots are deterministic and
-        non-overlapping for up to ~6 drones per zone."""
+        keyed off its agent_id so spots are deterministic and
+        non-overlapping for up to ~6 drones per zone. Uses a checksum of the
+        id bytes rather than hash() — Python salts hash() per process, which
+        would make cart positions (and therefore dose) vary run-to-run."""
         # 8 slots round the zone perimeter at ~60% of its radius
-        slot = (hash(self.agent_id) % 8) / 8.0
+        slot = (sum(self.agent_id.encode()) % 8) / 8.0
         ang = slot * 2 * math.pi
         r = zone.radius_m * 0.55
         return (zone.x + r * math.cos(ang),
@@ -486,18 +474,17 @@ class Agent:
 
     # ---------- mobile agent main loop ----------
 
-    def run(self, scan_queue: simpy.Store, handle_queue: simpy.Store,
-            rescan_queue: simpy.Store):
+    def run(self, handle_queue: simpy.Store, rescan_queue: simpy.Store):
         """Two queues feed the mobile fleet:
 
-          scan_queue   — items that need an NaI + CV triage (Scanner/Hybrid).
-          handle_queue — items already classified, awaiting transport
-                         to storage / QA lab (Handler/Hybrid).
-          rescan_queue — items waiting at the QA lab for HPGe rescrutiny
+          handle_queue — drums awaiting transport (gen point -> Char Station,
+                         Char Station -> storage, or -> QA lab if flagged).
+          rescan_queue — drums waiting at the QA lab for HPGe rescrutiny
                          (only the fixed drum-scanner station drains this).
 
-        Scanners pull only from scan_queue, Handlers only from
-        handle_queue, Hybrids pull from either."""
+        Every mobile cart is a transport AGV: it pulls a handle task and
+        ferries the drum. Classification happens centrally at the Char
+        Station, never on the cart."""
         if self.is_rescrutiny_station:
             yield self.env.process(self._rescrutiny_loop(rescan_queue))
             return
@@ -505,7 +492,7 @@ class Agent:
         while True:
             try:
                 yield self.env.process(self._one_task_iteration(
-                    scan_queue, handle_queue, rescan_queue,
+                    handle_queue, rescan_queue,
                 ))
             except simpy.Interrupt:
                 # Killed mid-task — drop carried item (scenario.kill_drone
@@ -515,38 +502,16 @@ class Agent:
                 self.state = "FAILED"
                 # Top-of-loop is reached via the implicit while True wraparound
 
-    def _get_next_task(self, scan_queue: simpy.Store, handle_queue: simpy.Store):
-        """Pick the next task respecting this agent's capabilities. In
-        HIVEMIND mode the coordinator dispatcher has already routed tasks
-        into a per-agent dispatch_queue. In ISOLATED mode each agent pulls
-        from the global scan/handle queues directly, filtered by role."""
+    def _get_next_task(self, handle_queue: simpy.Store):
+        """Pick the next transport task. In HIVEMIND the coordinator
+        dispatcher has already routed a task into this cart's per-agent
+        dispatch_queue; in ISOLATED every cart pulls from the shared
+        handle_queue."""
         if self.dispatch_queue is not None:
-            task = yield self.dispatch_queue.get()
-            return task
-        caps = AGENT_CAPABILITIES[self.agent_type]
-        if "scan" in caps and "handle" in caps:
-            # Hybrid: prefer handle (transport backlog clears faster), fall
-            # back to scan when handle is empty. simpy.AnyOf returns when
-            # the first of multiple events fires.
-            handle_get = handle_queue.get()
-            scan_get = scan_queue.get()
-            result = yield self.env.any_of([handle_get, scan_get])
-            if handle_get in result:
-                task = result[handle_get]
-                scan_get.cancel()
-            else:
-                task = result[scan_get]
-                handle_get.cancel()
-            return task
-        if "scan" in caps:
-            return (yield scan_queue.get())
-        if "handle" in caps:
-            return (yield handle_queue.get())
-        # Should not happen for mobile drones
+            return (yield self.dispatch_queue.get())
         return (yield handle_queue.get())
 
-    def _one_task_iteration(self, scan_queue: simpy.Store,
-                            handle_queue: simpy.Store,
+    def _one_task_iteration(self, handle_queue: simpy.Store,
                             rescan_queue: simpy.Store):
         """Single pass of the main loop, factored out so it can be wrapped
         in a try/except simpy.Interrupt at the call site."""
@@ -582,157 +547,12 @@ class Agent:
 
         self._refresh_model_if_needed()
         self.state = "IDLE"
-        task = yield self.env.process(self._get_next_task(scan_queue, handle_queue))
-        kind = task.get("kind", "handle")
-        if kind == "scan":
-            yield self.env.process(self._scan_task(task, handle_queue))
-        elif kind == "handle":
-            yield self.env.process(self._handle_task(task, rescan_queue))
-        # Unknown kinds are dropped; an event-log warning could be added later.
+        task = yield self.env.process(self._get_next_task(handle_queue))
+        # Every cart task is a transport (handle) task — classification is
+        # centralised at the Char Station, so carts never scan.
+        yield self.env.process(self._handle_task(task, rescan_queue))
 
-    # ---------- scan-only task: visit-in-place, classify, report ----------
-
-    def _scan_task(self, task: dict, handle_queue: simpy.Store):
-        """Scanner / Hybrid behaviour: drive to where the item currently
-        sits (typically its gen point), perform an NaI + CV scan in-place
-        without picking it up, report the classification to the coordinator,
-        then enqueue a follow-up handle task so a Handler / Hybrid can
-        actually transport the (now classified) drum to its destination."""
-        item: WasteItem = task["item"]
-        pickup_zone: Zone = task["pickup_zone"]
-
-        # HLW process-known items don't need scanning. They should only
-        # appear on handle_queue, but be defensive in case one is mis-routed.
-        if item.process_known_class == "HLW":
-            self._enqueue_handle({
-                "kind": "handle", "item": item,
-                "pickup_zone": pickup_zone,
-                "target_zone": storage_zone_for("HLW"),
-                "is_hlw_route": True, "needs_qa": False,
-            }, handle_queue)
-            return
-
-        self.state = "MOVING_TO_PICKUP"
-        yield self.env.process(self._move_to(self._zone_park_pos(pickup_zone)))
-        if self.failed():
-            return
-
-        # In-place scan — no PICKING_UP step, the drum stays where it is.
-        # Expose the item so the live view can draw the deployable
-        # classification arm reaching out to this specific drum.
-        self.scanning_item = item
-        self.scanning_zone_name = pickup_zone.name
-        self.state = "ACQUIRING"
-        yield self.env.timeout(8.0)
-        self._drain_battery(8.0, active=True)
-        spectrum = simulate_spectrum(
-            item.activities_bq, 8.0, NAI_DETECTOR, distance_m=0.4, rng=self.rng,
-        )
-        dose_rate = simulate_dose_rate(
-            item.activities_bq, distance_m=0.4, rng=self.rng,
-        )
-        cv_probs = simulate_cv_classification(
-            item.true_class, item.tricky, rng=self.rng,
-        )
-        self._accrue_dose(8.0, dose_rate)
-
-        self.state = "CLASSIFYING"
-        yield self.env.timeout(0.5)
-        result = self.local_classifier.classify(
-            item.total_specific_activity_bq_per_g, dose_rate, spectrum,
-            cv_probs=cv_probs,
-        )
-        # Cart-side process noise — see CART_ERROR_RATE docstring. We
-        # apply the off-by-one shift after the classifier so the
-        # spectrum features used for downstream training still reflect
-        # the (correct) signal; only the predicted_class is perturbed.
-        if self.rng.random() < CART_ERROR_RATE:
-            result.predicted_class = _shift_one_class(
-                result.predicted_class, self.rng,
-            )
-
-        # Done scanning — release the arm.
-        self.scanning_item = None
-        self.scanning_zone_name = None
-        self.state = "REPORTING"
-        # Stash the spectrum so the live-view panel can show "what the AI
-        # just looked at" prominently — judges read the actinide-window
-        # signature here and see why a tricky drum gets caught.
-        self.coordinator.last_scan_event = {
-            "item_id": item.item_id,
-            "agent_id": self.agent_id,
-            "spectrum": spectrum,
-            "features": result.spectrum_features,
-            "predicted_class": result.predicted_class,
-            "confidence": result.confidence,
-            "actinide_signature": result.actinide_signature,
-            "true_class": item.true_class,
-            "tricky": item.tricky,
-            "t_s": self.env.now,
-        }
-        self.coordinator.receive_report(
-            item_id=item.item_id,
-            agent_id=self.agent_id,
-            predicted_class=result.predicted_class,
-            confidence=result.confidence,
-            spectrum_features=result.spectrum_features,
-            true_label_for_training=None,
-            is_rescrutiny=False,
-        )
-        self.metrics.record_classification(
-            item_id=item.item_id,
-            true_class=item.true_class,
-            predicted_class=result.predicted_class,
-            confidence=result.confidence,
-            scrutiny=result.confidence < self.coordinator.scrutiny_confidence_threshold,
-            agent_id=self.agent_id,
-            timestamp_s=self.env.now,
-        )
-
-        entry = self.coordinator.ledger.get(item.item_id)
-        scrutiny = entry.scrutiny_flag if entry else False
-        if (
-            not scrutiny
-            and self.qa_sampling_fraction > 0.0
-            and self.rng.random() < self.qa_sampling_fraction
-        ):
-            scrutiny = True
-            if entry is not None:
-                entry.scrutiny_flag = True
-
-        # Build the follow-up handle task and enqueue it. The Handler /
-        # Hybrid pool will pick this up and actually move the drum.
-        if scrutiny:
-            target = ZONES_BY_NAME["QA lab"]
-            handle_task = {
-                "kind": "handle", "item": item,
-                "pickup_zone": pickup_zone, "target_zone": target,
-                "needs_qa": True, "is_hlw_route": False,
-            }
-        else:
-            # Clearance / free-release: VLLW drums below the clearance
-            # threshold go back to general industry rather than long-term
-            # storage. This is the recycling story — hivemind's better
-            # accuracy unlocks more free-release material than isolated.
-            if (
-                result.predicted_class == "VLLW"
-                and item.total_specific_activity_bq_per_g < CLEARANCE_THRESHOLD_BQ_PER_G
-                and clearance_zone() is not None
-            ):
-                target = clearance_zone()
-                is_clearance = True
-            else:
-                target = storage_zone_for(result.predicted_class)
-                is_clearance = False
-            handle_task = {
-                "kind": "handle", "item": item,
-                "pickup_zone": pickup_zone, "target_zone": target,
-                "needs_qa": False, "is_hlw_route": False,
-                "is_clearance": is_clearance,
-            }
-        self._enqueue_handle(handle_task, handle_queue)
-
-    # ---------- handle-only task: pickup, transport, drop off ----------
+    # ---------- transport task: pickup, route, drop off ----------
 
     def _handle_task(self, task: dict, rescan_queue: simpy.Store):
         """Handler / Hybrid behaviour: drive to the pickup zone, pick up the
@@ -805,16 +625,6 @@ class Agent:
             if task.get("is_clearance"):
                 self.metrics.items_released += 1
             # Drone parks here; next iteration's IDLE wait happens in place.
-
-    def _enqueue_handle(self, task: dict, handle_queue: simpy.Store) -> None:
-        """Hand the follow-up handle task back to the right queue. In
-        HIVEMIND the coordinator owns the pending pool (dispatcher will
-        route it to the best Handler/Hybrid); in ISOLATED it goes to the
-        shared global handle_queue."""
-        if self.coordinator.shared:
-            self.coordinator.enqueue_task(task)
-        else:
-            handle_queue.put(task)
 
     # ---------- HLW process-known route ----------
 

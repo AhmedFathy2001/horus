@@ -52,10 +52,15 @@ class Coordinator:
         shared: bool,
         retrain_every_n_reports: int = 12,
         scrutiny_confidence_threshold: float = 0.70,
+        rng: np.random.Generator | None = None,
     ):
         self.shared = shared
         self.retrain_every_n_reports = retrain_every_n_reports
         self.scrutiny_confidence_threshold = scrutiny_confidence_threshold
+        # Seeded RNG for the wireless packet-drop sim. Must NOT be the global
+        # np.random (that made dose/accuracy non-reproducible across runs of
+        # the same --seed). The scenario builder passes a seeded generator.
+        self.rng = rng if rng is not None else np.random.default_rng()
         self.ledger: dict[str, InventoryEntry] = {}
         # Aggregated labeled training data for the shared classifier
         self._training_features: deque = deque(maxlen=2000)
@@ -85,7 +90,7 @@ class Coordinator:
         self.dispatch_log: list[dict] = []
         # Telemetry for the live view's "queen activity" line
         self.last_dispatch_decision: dict | None = None
-        # The most recent scanner classification event. The live view reads
+        # The most recent Char-Station classification event. The live view reads
         # this to render a "what the AI is looking at right now" spectrum
         # panel: full NaI spectrum + photopeak windows + actinide signature
         # + verdict + confidence.
@@ -172,7 +177,7 @@ class Coordinator:
         if (
             not is_rescrutiny
             and self.packet_drop_probability > 0.0
-            and np.random.random() < self.packet_drop_probability
+            and self.rng.random() < self.packet_drop_probability
         ):
             self.recent_messages.append({
                 "t_s": time.time(),

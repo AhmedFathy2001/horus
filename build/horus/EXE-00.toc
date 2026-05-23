@@ -57,7 +57,7 @@
  [],
  False,
  False,
- 1779509924,
+ 1779524594,
  [('runw',
    '/Users/ahmed/Desktop/Projects/horus/.venv/lib/python3.13/site-packages/PyInstaller/bootloader/Darwin-64bit/runw',
    'EXECUTABLE')],

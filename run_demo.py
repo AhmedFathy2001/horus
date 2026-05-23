@@ -45,13 +45,11 @@ def parse_args():
     p.add_argument("--interarrival-s", type=float, default=45.0)
     p.add_argument("--agents", type=int, default=0,
                    help="Legacy single-knob fleet size (builds all Hybrids). "
-                        "Ignored when --scanners/--handlers/--hybrids are set.")
-    p.add_argument("--scanners", type=int, default=2,
-                   help="Number of sensor-only Scanner AGVs in the fleet.")
-    p.add_argument("--handlers", type=int, default=3,
-                   help="Number of gripper-only Handler AGVs in the fleet.")
+                        "Ignored when --handlers/--hybrids are set.")
+    p.add_argument("--handlers", type=int, default=5,
+                   help="Number of Handler transport carts in the fleet.")
     p.add_argument("--hybrids",  type=int, default=1,
-                   help="Number of full-capability Hybrid AGVs in the fleet.")
+                   help="Number of Hybrid transport carts (quicker chassis).")
     p.add_argument("--tricky-fraction", type=float, default=0.25)
     p.add_argument("--qa-fraction", type=float, default=0.05)
     p.add_argument("--net-drop", type=float, default=0.03,
@@ -77,10 +75,9 @@ def build_cfg(args, mode: str):
         qa_sampling_fraction=args.qa_fraction,
         network_drop_probability=args.net_drop,
     )
-    # If the user explicitly mixed the fleet, use those counts. Otherwise
+    # If the user explicitly sized the fleet, use those counts. Otherwise
     # fall back to --agents (legacy: all-hybrid).
-    if args.scanners + args.handlers + args.hybrids > 0:
-        cfg_kwargs["n_scanners"] = args.scanners
+    if args.handlers + args.hybrids > 0:
         cfg_kwargs["n_handlers"] = args.handlers
         cfg_kwargs["n_hybrids"] = args.hybrids
     elif args.agents > 0:
@@ -98,7 +95,6 @@ def run_one(args, mode: str, live_view=None):
         # When the user has tuned the fleet live (F-cycle then X-restart),
         # honour that composition instead of the CLI-derived one.
         if live_view is not None and live_view.live_fleet is not None:
-            cfg.n_scanners = live_view.live_fleet["scanner"]
             cfg.n_handlers = live_view.live_fleet["handler"]
             cfg.n_hybrids  = live_view.live_fleet["hybrid"]
             cfg.n_mobile_agents = 0  # disable legacy single-knob fallback
@@ -112,7 +108,7 @@ def run_one(args, mode: str, live_view=None):
                 return _v.on_tick(ctx)
         print(f"\n[{mode}] running scenario seed={args.seed}, "
               f"{args.sim_hours:.1f}h simulated... "
-              f"(fleet: {cfg.n_scanners}sc/{cfg.n_handlers}hd/{cfg.n_hybrids}hy)")
+              f"(fleet: {cfg.n_handlers}hd/{cfg.n_hybrids}hy)")
         metrics, coord, agents = run_scenario(cfg, on_tick=on_tick)
         s = metrics.summary()
         print(f"[{mode}]   classified : {s['n_classified']}")

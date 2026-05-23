@@ -6,9 +6,11 @@ A multi-agent simulation of robotic radioactive-waste classification at a
 nuclear power plant. A central **coordinator** learns from the
 high-resolution QA lab and pushes a learned actinide-spike threshold
 into a centralized drum-characterization station so a fleet of mobile
-**cart agents** (scanner / handler / hybrid AGVs) can keep the line moving
-and catch tricky waste items that look like LLW by activity but are
-really ILW by composition.
+**cart agents** (transport AGVs) can keep the line moving and catch
+tricky waste items that look like LLW by activity but are really ILW by
+composition. Classification happens once, centrally, at the Char Station —
+the carts are dumb transports that ferry drums to it and route the verdicts
+onward.
 
 The facility models a simplified end-to-end PUREX reprocessing pipeline:
 upstream stages (Spent Fuel Receipt → Shearing → Dissolution → Solvent
@@ -21,9 +23,10 @@ contact-handling sources (Cleanup ops / Maintenance / Plant samples)
 where the centralized NaI scan must catch the actinide-masquerade trick.
 
 The point of this sim is to make one architectural claim demo-able on a
-laptop in under a minute: **coordinated classification with collective
-learning measurably outperforms isolated single-agent classification on
-classification accuracy, with no penalty in throughput.**
+laptop in under a minute: **a classifier with the coordinator's collective
+learning loop (hivemind) measurably outperforms the same classifier with that
+loop switched off (isolated) on classification accuracy, with no penalty in
+throughput.**
 
 ## Quick start
 
@@ -52,9 +55,8 @@ You'll get:
 | `--seed N`                | `1`      | seed `1` is the cleanest demo scenario |
 | `--sim-hours H`           | `8`      | one operating shift |
 | `--interarrival-s S`      | `45`     | mean Poisson interarrival |
-| `--scanners N`            | `2`      | sensor-only AGVs (auto-promoted to handlers — see below) |
-| `--handlers N`            | `3`      | gripper-only ferry AGVs |
-| `--hybrids N`             | `1`      | full-capability AGVs (scan + handle) |
+| `--handlers N`            | `5`      | gripper transport AGVs |
+| `--hybrids N`             | `1`      | transport AGVs with a quicker chassis |
 | `--agents N`              | `0`      | legacy single-knob fleet size (all-hybrid); ignored when role flags are set |
 | `--tricky-fraction F`     | `0.25`   | fraction of items with actinide-spike trick |
 | `--qa-fraction F`         | `0.05`   | random items sent to HPGe regardless of confidence |
@@ -65,9 +67,9 @@ You'll get:
 | `--audit-csv path`        | —        | dump coordinator's ledger as CSV |
 
 > Default fleet is **6 cart-style AGVs**: `handler-1`…`handler-5` plus
-> `hybrid-1`. With centralized characterization, pure scanners are
-> obsolete (carts only transport) so any requested scanner slots are
-> silently promoted to handlers.
+> `hybrid-1`. With centralized characterization at the Char Station, every
+> cart is a pure transport AGV (Handlers and Hybrids differ only by chassis
+> speed) — there is no roaming "scanner" role.
 
 ## What you should see
 
@@ -75,10 +77,10 @@ You'll get:
 - **Cart fleet** (default 6) shuttles between generation points, the
   central **Drum Characterization Station** (zone tag `CLASSIFY`), and
   storage. Agent colour indicates state: green = idle, blue = moving,
-  orange = acquiring, magenta = classifying, cyan = charging, red = decon.
-- A **field-of-vision cone** is drawn in front of each active cart — a
-  60° wedge that follows the direction of motion, indicating which part
-  of the facility the on-board camera + sensors can see at any moment.
+  cyan = charging, red = decon. Carts don't classify — they transport.
+- The **Spent Fuel Pool** (`POOL`) is both the visual origin of the plant
+  and a real waste source: pool filters / sludge / contaminated tools flow
+  from it to the Char Station like any other generation cell.
 - One fixed station agent (`char-A`) is anchored at the HPGe **QA lab**
   and re-classifies items the central classifier flagged low-confidence
   or that came in via random QA sampling.
@@ -195,7 +197,9 @@ Once the pygame window is focused:
 
 ### Dashboard
 - **Headline bars** (top row): accuracy, cumulative worker dose, throughput.
-  Hivemind should beat isolated on accuracy by 5–10 percentage points.
+  Hivemind beats isolated on accuracy on every seed; on the clean seeds the
+  gap is ~10–14 percentage points (seed `1`: ~+12 pp), smaller on noisier
+  ones.
 - **Confusion matrices**: in isolated mode you'll typically see a chunky
   `(true=ILW → predicted=LLW)` cell. In hivemind, that cell empties out
   after the coordinator pushes the threshold.
@@ -203,14 +207,18 @@ Once the pygame window is focused:
   and refined as more HPGe rescrutiny labels come in.
 
 ### Honest caveats
-- The **dose metric is noisy** — it's dominated by the in-transit handling
-  of high-activity normal ILW items, which is identical in both modes.
-  The hivemind advantage on dose comes from misrouted ILW items sitting
-  unshielded at LLW storage and being exposed during periodic worker
-  inspections. Across seeds, hivemind dose is at or below isolated, but
-  the gap is variance-bound. **Average across several seeds** for a robust
-  read; default seed `1` shows the cleanest single-shot.
-- The **accuracy gap is consistent** across seeds.
+- The **dose metric is a bounded model, not a transport calculation.** Worker
+  dose is charged from hot drums (ILW) sitting unshielded in the low-level
+  store because they were mis-filed — each waste class has a representative
+  exposure rate, so the dose signal tracks *how many* drums are mis-routed,
+  not one drum's raw activity. Hivemind mis-routes far fewer, so its dose is
+  **at or below** isolated across seeds — often 20–50% lower, occasionally
+  about equal. Average across a few seeds for a robust read; seed `1` is the
+  cleanest single-shot. Every run is now fully reproducible for a given
+  `--seed` (the upstream RNG used to be salted by Python's per-process string
+  hashing — fixed).
+- The **accuracy gap is consistent in sign** (hivemind always wins) but its
+  size varies by seed, ~3–14 pp on a short shift and wider on a full one.
 - Throughput is essentially the same in both modes (which is the point:
   the hivemind doesn't cost you items/hour).
 
@@ -229,9 +237,9 @@ Once the pygame window is focused:
               reports│   snapshots│                       │
             ┌────────▼────┐  ┌────▼─────────────┐  ┌─────▼─────────┐
             │ Char Station│  │ Cart fleet       │  │ QA lab agent  │
-            │ (CLASSIFY)  │  │ scanner /        │  │ (HPGe, char-A)│
-            │ central NaI │  │ handler /        │  │ authoritative │
-            │ + CV head   │  │ hybrid AGVs      │  │ re-class.     │
+            │ (CLASSIFY)  │  │ transport AGVs   │  │ (HPGe, char-A)│
+            │ central NaI │  │ (handler /       │  │ authoritative │
+            │ + CV head   │  │  hybrid)         │  │ re-class.     │
             └─────────────┘  └──────────────────┘  └───────────────┘
 ```
 
@@ -333,7 +341,7 @@ sim/
   facility.py                   # 2D zones, direct-line travel
   classifier.py                 # rules + learned actinide threshold + k-NN
   coordinator.py                # ledger, retrain, threshold derivation, snapshots, failover
-  agent.py                      # state machine for scanner/handler/hybrid carts + QA station
+  agent.py                      # state machine for transport carts (handler/hybrid) + QA station
   metrics.py                    # accuracy / dose / throughput tracking
   scenario.py                   # builds and runs end-to-end with simpy; Char station actuator
 viz/

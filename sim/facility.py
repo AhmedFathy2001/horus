@@ -6,10 +6,13 @@ zones, and proximity-to-worker can be computed for the dose model.
 The layout has three vertical bands:
 
   TOP (y ~ 2-5 m)  — upstream PUREX reprocessing chain:
-                    Spent Fuel Receipt -> Shearing -> Dissolution ->
+                    Spent Fuel Pool -> Shearing -> Dissolution ->
                     Solvent Extraction -> HLW Concentration -> Solidification.
-                    These are *waste sources* (each produces a typed stream)
-                    plus Solidification, which is a transit step for HLW.
+                    The arrows between them show the real PUREX material flow.
+                    The Spent Fuel Pool, Shearing, Dissolution and HLW
+                    Concentration cells each shed a waste stream that carts
+                    ferry to the Classifier; Solvent Extraction is a liquid
+                    process step and Solidification a transit step for HLW.
   MIDDLE (y ~ 7-15 m) — robot working area: Charging bay, Worker area,
                     Quick scan, QA lab, Robot wash, Coordinator pillar.
   RIGHT (x > 42 m) — storage stacks: VLLW / LLW / ILW / HLW.
@@ -49,7 +52,11 @@ ZONES: list[Zone] = [
     # for the robot fleet. Solidification is a transit step (HLW only).
     # The Spent Fuel Pool is the first stop after receipt — water-cooled
     # storage where assemblies cool for ~5 years before being lifted to
-    # Shearing by the overhead Fuel Handling Machine.
+    # Shearing by the overhead Fuel Handling Machine. It is ALSO a waste
+    # source: pool filters, sludge, and contaminated tools are shed as a
+    # mixed contact-waste stream that carts ferry to the Classifier (see
+    # drum_source_zones()), so the plant's visual origin is also where the
+    # sorting pipeline starts.
     Zone("Spent fuel pool",     4.0,  3.0, 2.0, "fuel_pool",     (30, 90, 140),   short="POOL"),
     Zone("Shearing cell",      10.0,  3.0, 1.3, "generation",    (200, 180, 160), short="SHEAR", produces_class="LLW"),
     Zone("Dissolution cell",   14.5,  3.0, 1.3, "generation",    (220, 160, 160), short="DISS",  produces_class="HLW"),
@@ -131,6 +138,27 @@ def generation_points() -> list[Zone]:
     return list(ZONES_BY_ROLE.get("generation", []))
 
 
+# The Spent Fuel Pool is the visual origin of the plant, so it must also be a
+# real source of sorting work: pool-water filters, sludge, and contaminated
+# handling tools are shed as a mixed contact-waste stream that carts ferry to
+# the central Classifier (exactly like the Cleanup/Maintenance/Sample sources).
+# Kept as its own zone role ("fuel_pool") so its underwater interior still
+# renders; this list is what makes it a drum source for routing + the flow
+# arrows.
+POOL_SOURCE_NAME = "Spent fuel pool"
+
+
+def drum_source_zones() -> list[Zone]:
+    """Every zone that emits waste drums into the sorting pipeline (i.e. feeds
+    the central Classifier): the generation-role cells plus the Spent Fuel
+    Pool. Used by the live view's flow arrows and by the scenario builder."""
+    out = list(ZONES_BY_ROLE.get("generation", []))
+    pool = ZONES_BY_NAME.get(POOL_SOURCE_NAME)
+    if pool is not None:
+        out.append(pool)
+    return out
+
+
 def worker_zones() -> list[Zone]:
     return list(ZONES_BY_ROLE.get("worker", []))
 
@@ -154,9 +182,9 @@ def clearance_zone() -> Zone | None:
 
 
 def char_station_zone() -> Zone | None:
-    """Drum Characterisation Station — where drums get scanned. Handlers
-    stage drums on the turntable; Scanners classify them in place; then
-    Handlers route them out to storage or the QA lab."""
+    """Drum Characterisation Station — where drums get scanned. Carts stage
+    drums on the turntable; the station's overhead NaI + CV gantry classifies
+    them centrally; then carts route them out to storage or the QA lab."""
     zs = ZONES_BY_ROLE.get("char_station", [])
     return zs[0] if zs else None
 
