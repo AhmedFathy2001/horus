@@ -1,0 +1,45 @@
+name: Build HORUS binaries
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-latest
+            artifact: horus-windows
+            path: dist/horus
+          - os: macos-latest
+            artifact: horus-macos-arm64
+            path: dist/HORUS.app
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+          pip install pyinstaller
+
+      - name: Build with PyInstaller
+        run: pyinstaller --noconfirm horus.spec
+
+      - name: Strip quarantine (macOS)
+        if: matrix.os == 'macos-latest'
+        run: xattr -cr dist/HORUS.app || true
+
+      - name: Upload binary folder
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.artifact }}
+          path: ${{ matrix.path }}

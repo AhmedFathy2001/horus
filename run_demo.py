@@ -8,7 +8,28 @@
 """
 from __future__ import annotations
 import argparse
+import os
 import sys
+from pathlib import Path
+
+
+def _ensure_stdio():
+    """In windowed PyInstaller builds (console=False) sys.stdout / sys.stderr
+    are None, which makes any print() raise AttributeError. Redirect to a log
+    file under the user's home so the app stays runnable and debuggable."""
+    if sys.stdout is not None and sys.stderr is not None:
+        return
+    log_dir = Path.home() / ".horus"
+    log_dir.mkdir(parents=True, exist_ok=True)
+    log_path = log_dir / "horus.log"
+    f = open(log_path, "a", buffering=1, encoding="utf-8")
+    if sys.stdout is None:
+        sys.stdout = f
+    if sys.stderr is None:
+        sys.stderr = f
+
+
+_ensure_stdio()
 
 
 def parse_args():
@@ -109,7 +130,16 @@ def run_one(args, mode: str, live_view=None):
         # (possibly new) fleet
 
 
+BANNER = (
+    "============================================================\n"
+    "  HORUS — Hivemind for Onboard Radiological Understanding & Sorting\n"
+    "  Pantomath · Hackatom 2026\n"
+    "============================================================"
+)
+
+
 def main():
+    print(BANNER)
     args = parse_args()
 
     live_view = None

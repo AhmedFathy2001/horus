@@ -744,8 +744,13 @@ class LiveView:
     def _draw_header(self, ctx):
         # Mode chip
         mode_col = (110, 180, 230) if self.mode_label == "hivemind" else (210, 140, 80)
-        title = self.font_xl.render("Radwaste hivemind sim", True, HI_TEXT)
-        self.screen.blit(title, (16, 14))
+        title = self.font_xl.render("HORUS", True, HI_TEXT)
+        self.screen.blit(title, (16, 8))
+        subtitle = self.font_xs.render(
+            "Hivemind for Onboard Radiological Understanding & Sorting",
+            True, HI_TEXT,
+        )
+        self.screen.blit(subtitle, (16, 8 + title.get_height() + 2))
         mode_w = self.font_l.size(f"  {self.mode_label.upper()}  ")[0]
         pygame.draw.rect(self.screen, mode_col, (title.get_width() + 30, 18, mode_w + 8, 26), border_radius=5)
         mode_txt = self.font_l.render(f"  {self.mode_label.upper()}  ", True, (20, 22, 28))
