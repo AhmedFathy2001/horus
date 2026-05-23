@@ -1,0 +1,28 @@
+{
+  "_source": "IAEA GSG-1 (Classification of Radioactive Waste, 2009) — simplified for sim.",
+  "_units": {
+    "specific_activity": "Bq/g",
+    "dose_rate": "uSv/h at 30 cm"
+  },
+  "_notes": [
+    "These are order-of-magnitude class boundaries for sim purposes only.",
+    "Real classification depends on radionuclide-specific clearance/exemption levels (GSR Part 3 Schedule I) and on heat generation for the ILW/HLW boundary.",
+    "VLLW upper bound is set from clearance levels of common LWR nuclides (Cs-137, Co-60).",
+    "ILW lower bound aligns with the conventional surface-dose criterion (>2 mSv/h on contact for un-shielded items)."
+  ],
+  "class_boundaries": {
+    "VLLW_max_specific_activity_bq_per_g": 100.0,
+    "LLW_max_specific_activity_bq_per_g": 1.0e5,
+    "VLLW_max_dose_rate_uSv_h": 2.0,
+    "LLW_max_dose_rate_uSv_h": 50000.0,
+    "ILW_min_dose_rate_uSv_h": 50000.0
+  },
+  "scrutiny": {
+    "confidence_threshold": 0.70,
+    "_comment": "Items classified below this confidence get a scrutiny flag and are routed to the HPGe drum scanner for re-classification."
+  },
+  "shielding": {
+    "ILW_min_shielding_required": true,
+    "_comment": "Worker-dose model assumes ILW in transit must be in shielded cask; LLW does not. Misclassifying ILW as LLW => exposure event."
+  }
+}
