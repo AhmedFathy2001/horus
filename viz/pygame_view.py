@@ -19,12 +19,15 @@ import math
 import os
 from collections import deque
 from dataclasses import dataclass, field
+from pathlib import Path
 
 import pygame
 
 from sim.facility import (
     ZONES, ZONES_BY_NAME, WIDTH_M, HEIGHT_M,
 )
+
+ICON_PATH = Path(__file__).parent.parent / "assets" / "horus_icon.png"
 
 
 # --- Layout ---------------------------------------------------------------
@@ -204,12 +207,17 @@ class LogEvent:
 
 @dataclass
 class LiveView:
-    title: str = "Radwaste Hivemind Sim"
+    title: str = "HORUS — Hivemind for Onboard Radiological Understanding & Sorting"
     target_fps: int = 30
 
     def __post_init__(self):
         os.environ.setdefault("SDL_VIDEO_CENTERED", "1")
         pygame.init()
+        if ICON_PATH.exists():
+            try:
+                pygame.display.set_icon(pygame.image.load(str(ICON_PATH)))
+            except pygame.error:
+                pass
         self.screen = pygame.display.set_mode((WINDOW_W, WINDOW_H))
         pygame.display.set_caption(self.title)
         self.font_xs   = pygame.font.SysFont("Menlo, Consolas, monospace", 11)
